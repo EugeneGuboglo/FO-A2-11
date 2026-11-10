@@ -481,16 +481,25 @@ int main(void) {
     /* 2. Восстановление после CAN Bus-Off */
     if (can_bus_off_flag) {
       can_bus_off_flag = 0;
-      HAL_CAN_Stop(&hcan2);
-      HAL_CAN_AbortTxRequest(&hcan2, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 |
-                                         CAN_TX_MAILBOX2);
-      HAL_Delay(10);
-      HAL_CAN_Start(&hcan2);
-      HAL_CAN_ActivateNotification(&hcan2, CAN_IT_ERROR | CAN_IT_BUSOFF);
+      if (DACS_ReinitAfterBusOff() != HAL_OK) {
+        can_bus_off_flag = 1; /* повторим на следующей итерации */
+      }
     }
 
     /* 3. CAN J1939: RX-опрос + периодический TX */
     DACS_Task();
+
+    static uint32_t s_last_can_mon = 0;
+    if ((ms_now() - s_last_can_mon) >= 100U) {
+      s_last_can_mon = ms_now();
+      uint8_t tec = 0, rec = 0;
+      if (DACS_GetErrorCounters(&tec, &rec)) {
+        /* TEC/REC можно логировать или использовать для доп. диагностики.
+           Выход в bus-off всё равно поймается через can_bus_off_flag. */
+        (void)tec;
+        (void)rec;
+      }
+    }
 
     /* 4. Обработка последнего запроса от CCU */
     const DACS_Request *req = DACS_GetLastRequest();
@@ -507,7 +516,7 @@ int main(void) {
                  req->airflowMode == DACS_MODE_PTC_HEATING ||
                  req->airflowMode == DACS_MODE_VENTILATION || DACS_MODE_PTC) {
 
-        if ( req->chest == DACS_ST_OFF && req->legs == DACS_ST_OFF &&
+        if (req->chest == DACS_ST_OFF && req->legs == DACS_ST_OFF &&
             req->windshield == DACS_ST_ON) {
           Chest_control(DACS_ST_OFF);
           Legs_control(DACS_ST_OFF);
@@ -543,7 +552,8 @@ int main(void) {
       Fan_Control(req->airflowMode, req->fanSpeedRaw);
 
       /* Контактор PTC — включаем только при вращении вентилятора */
-      if (req->airflowMode == DACS_MODE_PTC_HEATING || req->airflowMode == DACS_MODE_PTC) {
+      if (req->airflowMode == DACS_MODE_PTC_HEATING ||
+          req->airflowMode == DACS_MODE_PTC) {
         if (fun_speed > 0)
           Contactor_ON();
         else
@@ -650,14 +660,21 @@ static void MX_ADC1_Init(void) {
  * @brief CAN1 Initialization Function
  */
 static void MX_CAN1_Init(void) {
+  /* Безопасная инициализация: деинициализация переводит пины в аналоговый
+     режим (HAL_CAN_MspDeInit), разрывая связь с трансивером на время Init. */
+  if (hcan1.State != HAL_CAN_STATE_RESET) {
+    (void)HAL_CAN_DeInit(&hcan1);
+  }
+  HAL_Delay(1);
+
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 6;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan1.Init.TimeSeg1 = CAN_BS1_10TQ;
-  hcan1.Init.TimeSeg2 = CAN_BS2_3TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_11TQ; /* 500 kbps при PCLK1=42 МГц */
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
-  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE; /* восстановление — программное */
   hcan1.Init.AutoWakeUp = DISABLE;
   hcan1.Init.AutoRetransmission = DISABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
@@ -671,12 +688,17 @@ static void MX_CAN1_Init(void) {
  * @brief CAN2 Initialization Function
  */
 static void MX_CAN2_Init(void) {
+  if (hcan2.State != HAL_CAN_STATE_RESET) {
+    (void)HAL_CAN_DeInit(&hcan2);
+  }
+  HAL_Delay(1);
+
   hcan2.Instance = CAN2;
   hcan2.Init.Prescaler = 6;
   hcan2.Init.Mode = CAN_MODE_NORMAL;
   hcan2.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan2.Init.TimeSeg1 = CAN_BS1_10TQ;
-  hcan2.Init.TimeSeg2 = CAN_BS2_3TQ;
+  hcan2.Init.TimeSeg1 = CAN_BS1_11TQ;
+  hcan2.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan2.Init.TimeTriggeredMode = DISABLE;
   hcan2.Init.AutoBusOff = DISABLE;
   hcan2.Init.AutoWakeUp = DISABLE;
@@ -827,6 +849,7 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan) {
     if (HAL_CAN_GetError(hcan) & HAL_CAN_ERROR_BOF) {
       can_bus_off_flag = 1;
     }
+    /* Warning / Error Passive — можно логировать, действий не требуется */
   }
 }
 /* USER CODE END 4 */

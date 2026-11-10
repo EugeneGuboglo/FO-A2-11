@@ -94,6 +94,8 @@ const DACS_Request *DACS_GetLastRequest(void);
  * status ACSS2 (1 °C).
  */
 void DACS_MirrorRequestStatus(void);
+HAL_StatusTypeDef DACS_ReinitAfterBusOff(void);
+uint8_t           DACS_GetErrorCounters(uint8_t *tec, uint8_t *rec);
 
 #ifdef __cplusplus
 }

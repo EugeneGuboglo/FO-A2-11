@@ -23,103 +23,154 @@ static DACS_Request s_lastReq;
 static uint32_t s_lastTx1 = 0;
 static uint32_t s_lastTx2 = 0;
 
+/* ---- TX очередь ---- */
+#define TXQ_SIZE 16
+typedef struct {
+  uint32_t extId;
+  uint8_t data[8];
+} TxSlot_t;
+static TxSlot_t s_txq[TXQ_SIZE];
+static volatile uint8_t s_txHead = 0, s_txTail = 0;
+static volatile uint16_t s_txDropCount = 0;
+
+static uint8_t txq_push(uint32_t id, const uint8_t *d) {
+  uint8_t nxt = (s_txHead + 1U) % TXQ_SIZE;
+  if (nxt == s_txTail) {
+    s_txDropCount++;
+    return 0;
+  }
+  s_txq[s_txHead].extId = id;
+  memcpy(s_txq[s_txHead].data, d, 8);
+  s_txHead = nxt;
+  return 1;
+}
+static uint8_t txq_pop(TxSlot_t *out) {
+  if (s_txTail == s_txHead)
+    return 0;
+  *out = s_txq[s_txTail];
+  s_txTail = (s_txTail + 1U) % TXQ_SIZE;
+  return 1;
+}
+static void txq_clear(void) { s_txHead = s_txTail = 0; }
+
 /* ============================================================ */
 /*                       Low-level send                          */
 /* ============================================================ */
 
 static HAL_StatusTypeDef send_j1939(uint32_t extId, const uint8_t *data) {
+  if (s_hcan == NULL) return HAL_ERROR;
+  return txq_push(extId, data) ? HAL_OK : HAL_BUSY;
+}
+
+/* Отправляем всё, что накопилось в очереди, пока есть свободные mailbox */
+static void drain_tx_queue(void) {
+  TxSlot_t msg;
   CAN_TxHeaderTypeDef tx = {0};
   uint32_t mailbox;
 
-  if (s_hcan == NULL)
-    return HAL_ERROR;
-  if (HAL_CAN_GetTxMailboxesFreeLevel(s_hcan) == 0U)
-    return HAL_BUSY;
-
-  tx.ExtId = extId;
-  tx.IDE = CAN_ID_EXT;
-  tx.RTR = CAN_RTR_DATA;
-  tx.DLC = 8;
-
-  return HAL_CAN_AddTxMessage(s_hcan, &tx, (uint8_t *)data, &mailbox);
+  while (HAL_CAN_GetTxMailboxesFreeLevel(s_hcan) > 0U && txq_pop(&msg)) {
+    tx.ExtId = msg.extId;
+    tx.IDE   = CAN_ID_EXT;
+    tx.RTR   = CAN_RTR_DATA;
+    tx.DLC   = 8;
+    if (HAL_CAN_AddTxMessage(s_hcan, &tx, msg.data, &mailbox) != HAL_OK) {
+      break;   /* повторим на следующем цикле DACS_Task */
+    }
+  }
 }
 
 /* ============================================================ */
 /*                    Filter configuration                       */
 /* ============================================================ */
 
-static HAL_StatusTypeDef configure_filters(void) {
+static HAL_StatusTypeDef config_filter_bank(uint32_t bank,
+                                            uint32_t extId, uint32_t mask) {
   CAN_FilterTypeDef f = {0};
-  uint32_t tmp;
+  f.FilterBank           = bank;
+  f.FilterMode           = CAN_FILTERMODE_IDMASK;
+  f.FilterScale          = CAN_FILTERSCALE_32BIT;
+  f.FilterIdHigh         = (extId >> 13) & 0xFFFFU;
+  f.FilterIdLow          = ((extId << 3) & 0xFFF8U) | CAN_ID_EXT;
+  f.FilterMaskIdHigh     = (mask  >> 13) & 0xFFFFU;
+  f.FilterMaskIdLow      = ((mask  << 3) & 0xFFF8U) | CAN_ID_EXT;
+  f.FilterFIFOAssignment = CAN_RX_FIFO0;
+  f.FilterActivation     = ENABLE;
+  f.SlaveStartFilterBank = 14;
+  return HAL_CAN_ConfigFilter(s_hcan, &f);
+}
 
+static HAL_StatusTypeDef configure_filters(void) {
+  uint32_t tmp;
   __HAL_RCC_CAN1_CLK_ENABLE();
 
-  /* SlaveStartFilterBank = 14: банки 0..13 = CAN1, 14..27 = CAN2 */
-  tmp = CAN1->FMR;
+  tmp  = CAN1->FMR;
   tmp |= CAN_FMR_FINIT;
   tmp &= ~CAN_FMR_CAN2SB;
   tmp |= (14U << CAN_FMR_CAN2SB_Pos);
   CAN1->FMR = tmp;
 
-  f.FilterBank = 14;
-  f.FilterMode = CAN_FILTERMODE_IDMASK;
-  f.FilterScale = CAN_FILTERSCALE_32BIT;
-  f.FilterIdHigh = 0x0000;
-  f.FilterIdLow = 0x0000;
-  f.FilterMaskIdHigh = 0x0000;
-  f.FilterMaskIdLow = 0x0000;
-  f.FilterFIFOAssignment = CAN_RX_FIFO0;
-  f.FilterActivation = ENABLE;
-  f.SlaveStartFilterBank = 14;
-
-  return HAL_CAN_ConfigFilter(s_hcan, &f);
+  if (config_filter_bank(14, DACS_ID_DACSC, 0x1FFFFFFFU) != HAL_OK) return HAL_ERROR;
+  if (config_filter_bank(15, DACS_ID_AMB,   0x1FFFFFFFU) != HAL_OK) return HAL_ERROR;
+  if (config_filter_bank(16, (0xEAUL << 16) | (0x60UL  << 8),
+                             (0xFFUL  << 16) | (0xFFUL  << 8)) != HAL_OK) return HAL_ERROR;
+  if (config_filter_bank(17, (0xEAUL << 16) | (0xFFUL  << 8),
+                             (0xFFUL  << 16) | (0xFFUL  << 8)) != HAL_OK) return HAL_ERROR;
+  return HAL_OK;
 }
 
 /* ============================================================ */
 /*                          Init / task                          */
 /* ============================================================ */
 
+static HAL_StatusTypeDef can2_hardware_init(CAN_HandleTypeDef *hcan) {
+  if (hcan->State != HAL_CAN_STATE_RESET) {
+    (void)HAL_CAN_DeInit(hcan);   /* отцепляет пины через MspDeInit */
+  }
+  HAL_Delay(1);
+
+  hcan->Instance                = CAN2;
+  hcan->Init.Prescaler          = 6;
+  hcan->Init.Mode               = CAN_MODE_NORMAL;
+  hcan->Init.SyncJumpWidth      = CAN_SJW_1TQ;
+  hcan->Init.TimeSeg1           = CAN_BS1_11TQ;   /* 500 kbps */
+  hcan->Init.TimeSeg2           = CAN_BS2_2TQ;
+  hcan->Init.TimeTriggeredMode  = DISABLE;
+  hcan->Init.AutoBusOff         = DISABLE;        /* recovery — программное */
+  hcan->Init.AutoWakeUp         = DISABLE;
+  hcan->Init.AutoRetransmission = DISABLE;
+  hcan->Init.ReceiveFifoLocked  = DISABLE;
+  hcan->Init.TransmitFifoPriority = DISABLE;
+
+  return HAL_CAN_Init(hcan);
+}
+
 HAL_StatusTypeDef DACS_Init(CAN_HandleTypeDef *hcan) {
   s_hcan = hcan;
 
-  if (hcan->State != HAL_CAN_STATE_RESET) {
-    (void)HAL_CAN_DeInit(hcan);
-  }
-
-  hcan->Instance = CAN2;
-  hcan->Init.Prescaler = 6;
-  hcan->Init.Mode = CAN_MODE_NORMAL;
-  hcan->Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan->Init.TimeSeg1 = CAN_BS1_11TQ;
-  hcan->Init.TimeSeg2 = CAN_BS2_2TQ;
-  hcan->Init.TimeTriggeredMode = DISABLE;
-  hcan->Init.AutoBusOff = ENABLE;
-  hcan->Init.AutoWakeUp = DISABLE;
-  hcan->Init.AutoRetransmission = DISABLE;
-  hcan->Init.ReceiveFifoLocked = DISABLE;
-  hcan->Init.TransmitFifoPriority = DISABLE;
-
-  if (HAL_CAN_Init(hcan) != HAL_OK)
-    return HAL_ERROR;
-  if (configure_filters() != HAL_OK)
-    return HAL_ERROR;
-  if (HAL_CAN_Start(hcan) != HAL_OK)
-    return HAL_ERROR;
+  if (can2_hardware_init(hcan) != HAL_OK) return HAL_ERROR;
+  if (configure_filters()       != HAL_OK) return HAL_ERROR;
+  if (HAL_CAN_Start(hcan)       != HAL_OK) return HAL_ERROR;
   HAL_CAN_ActivateNotification(hcan, CAN_IT_ERROR | CAN_IT_BUSOFF);
-  memset(&s_lastReq, 0, sizeof(s_lastReq));
 
+  memset(&s_lastReq, 0, sizeof(s_lastReq));
   s_fanSpeedRaw = 0xFF;
   s_airflowMode = DACS_MODE_NA;
-  s_recircState = DACS_ST_NA;
-  s_windshieldState = DACS_ST_NA;
-  s_purifState = DACS_ST_NA;
-  s_chestState = DACS_ST_NA;
-  s_legsState = DACS_ST_NA;
-  s_interiorTempRaw = 0xFF;
-  s_exteriorTempRaw = 0xFF;
+  s_recircState = s_windshieldState = s_purifState = DACS_ST_NA;
+  s_chestState  = s_legsState      = DACS_ST_NA;
+  s_interiorTempRaw = s_exteriorTempRaw = 0xFF;
 
-  s_lastTx1 = HAL_GetTick();
-  s_lastTx2 = HAL_GetTick();
+  txq_clear();
+  s_lastTx1 = s_lastTx2 = HAL_GetTick();
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef DACS_ReinitAfterBusOff(void) {
+  if (s_hcan == NULL) return HAL_ERROR;
+  txq_clear();
+  if (can2_hardware_init(s_hcan) != HAL_OK) return HAL_ERROR;
+  if (configure_filters()        != HAL_OK) return HAL_ERROR;
+  if (HAL_CAN_Start(s_hcan)      != HAL_OK) return HAL_ERROR;
+  HAL_CAN_ActivateNotification(s_hcan, CAN_IT_ERROR | CAN_IT_BUSOFF);
   return HAL_OK;
 }
 
@@ -223,6 +274,10 @@ static void poll_rx(void) {
   CAN_RxHeaderTypeDef rx;
   uint8_t d[8];
 
+  if (__HAL_CAN_GET_FLAG(s_hcan, CAN_FLAG_FOV0)) {
+    __HAL_CAN_CLEAR_FLAG(s_hcan, CAN_FLAG_FOV0);
+  }
+
   while (HAL_CAN_GetRxFifoFillLevel(s_hcan, CAN_RX_FIFO0) > 0U) {
     if (HAL_CAN_GetRxMessage(s_hcan, CAN_RX_FIFO0, &rx, d) != HAL_OK)
       break;
@@ -245,22 +300,22 @@ static void poll_rx(void) {
 }
 
 void DACS_Task(void) {
-  uint32_t now;
-
-  if (s_hcan == NULL)
-    return;
+  if (s_hcan == NULL) return;
 
   poll_rx();
+  drain_tx_queue();                       /* ← новая строка */
 
-  now = HAL_GetTick();
-  if ((now - s_lastTx1) >= DACS_TX_PERIOD_MS) {
-    s_lastTx1 = now;
-    send_acss1();
-  }
-  if ((now - s_lastTx2) >= DACS_TX_PERIOD_MS) {
-    s_lastTx2 = now;
-    send_acss2();
-  }
+  uint32_t now = HAL_GetTick();
+  if ((now - s_lastTx1) >= DACS_TX_PERIOD_MS) { s_lastTx1 = now; send_acss1(); }
+  if ((now - s_lastTx2) >= DACS_TX_PERIOD_MS) { s_lastTx2 = now; send_acss2(); }
+}
+
+uint8_t DACS_GetErrorCounters(uint8_t *tec, uint8_t *rec) {
+  if (s_hcan == NULL) return 0;
+  uint32_t esr = s_hcan->Instance->ESR;
+  *tec = (uint8_t)((esr >> 16) & 0xFFU);
+  *rec = (uint8_t)((esr >> 24) & 0xFFU);
+  return 1;
 }
 
 /* Setters / getters и DACS_MirrorRequestStatus остаются без изменений */
